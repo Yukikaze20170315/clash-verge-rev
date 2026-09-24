@@ -1,0 +1,78 @@
+name: Isolated Windows repair build
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact source commit to validate and build
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: isolated-windows-repair
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      HUSKY: 0
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.21.0'
+          cache: pnpm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: isolated-windows-repair
+          cache-on-failure: true
+      - name: Validate formatting and Windows backend
+        shell: pwsh
+        run: |
+          cargo fmt --all --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p clash-verge --lib --features clippy core::runstate:: -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p clash-verge --lib --features clippy core::manager::lifecycle::tests -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prepare frontend and official runtime resources
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm run prebuild x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm run web:build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build production GUI without installer or release publishing
+        shell: pwsh
+        run: |
+          '{"build":{"beforeBuildCommand":""}}' | Set-Content -LiteralPath build-override.json
+          node node_modules/@tauri-apps/cli/tauri.js build --no-bundle --config build-override.json -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git rev-parse HEAD | Set-Content -LiteralPath source-commit.txt
+          Get-FileHash -LiteralPath target/release/clash-verge.exe -Algorithm SHA256 | Format-List | Out-File artifact-sha256.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-repair-${{ inputs.source_ref }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/release/clash-verge.exe
+            source-commit.txt
+            artifact-sha256.txt
